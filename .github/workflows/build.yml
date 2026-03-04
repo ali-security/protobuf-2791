@@ -1,0 +1,197 @@
+name: Build Python Wheels
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  linux-x86_64-wheel:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in manylinux2014_x86_64
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/protobuf -w /protobuf \
+            quay.io/pypa/manylinux2014_x86_64 bash -c '
+              source /opt/rh/devtoolset-10/enable
+              export PATH=/opt/python/cp38-cp38/bin:$PATH
+              ln -sf /opt/python/cp38-cp38/bin/python3 /usr/bin/python3
+              curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+                -o /usr/local/bin/bazel && chmod +x /usr/local/bin/bazel
+              pip install setuptools
+              bazel test //python/...
+              bazel build //python/dist:binary_wheel \
+                --//python:limited_api=True \
+                --//python:python_version=38 
+              mkdir -p wheels
+              for f in bazel-bin/python/dist/*.whl; do
+                cp "$f" wheels/$(basename "$f" | sed "s/linux_x86_64/manylinux2014_x86_64/")
+              done
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-wheel
+          path: wheels/
+
+  linux-aarch64-wheel:
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in manylinux2014_aarch64
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/protobuf -w /protobuf \
+            quay.io/pypa/manylinux2014_aarch64 bash -c '
+              source /opt/rh/devtoolset-10/enable
+              export PATH=/opt/python/cp38-cp38/bin:$PATH
+              ln -sf /opt/python/cp38-cp38/bin/python3 /usr/bin/python3
+              curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-arm64 \
+                -o /usr/local/bin/bazel && chmod +x /usr/local/bin/bazel
+              sed -i '184,209d' WORKSPACE # This is because the cargo aarch64 requires glibc 2.18 but this has 2.17. Since its not needed I remove it here.
+              pip install setuptools
+              bazel test //python/...
+              bazel build //python/dist:binary_wheel \
+                --//python:limited_api=True \
+                --//python:python_version=38 
+              mkdir -p wheels
+              for f in bazel-bin/python/dist/*.whl; do
+                cp "$f" wheels/$(basename "$f" | sed "s/linux_aarch64/manylinux2014_aarch64/")
+              done
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64-wheel
+          path: wheels/
+
+  macos-wheel:
+    runs-on: macos-15
+    if: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore libarclite for old deployment targets
+        run: |
+          XCODE_PATH=$(xcode-select -p)
+          ARC_DIR="${XCODE_PATH}/Toolchains/XcodeDefault.xctoolchain/usr/lib/arc"
+          sudo mkdir -p "$ARC_DIR"
+          sudo git clone https://github.com/kamyarelyasi/Libarclite-Files.git "$ARC_DIR"
+      - name: Build universal2 wheel
+        run: |
+          # pip install setuptools
+          # bazel test //python/...
+          brew install llvm
+          bazel clean --expunge
+          bazel sync --configure
+          bazel build //python/dist:binary_wheel \
+            --//python:limited_api=True \
+            --//python:python_version=38 \
+            --apple_platform_type=macos \
+            --macos_minimum_os=10.9 \
+            --macos_cpus=x86_64,arm64 \
+            --linkopt=-Wl,-fixup_chains \
+            --cpu=osx-universal2 \ 
+            --incompatible_enable_apple_toolchain_resolution
+          mkdir -p wheels && cp bazel-bin/python/dist/*.whl wheels/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-wheel
+          path: wheels/
+
+  windows-wheels:
+    if: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            bazel_cpu: win32
+            python: "3.8"
+            python_version: "38"
+            limited_api: "False"
+          - arch: x64
+            bazel_cpu: win64
+            python: "3.8"
+            python_version: "38"
+            limited_api: "False"
+          - arch: x86
+            bazel_cpu: win32
+            python: "3.9"
+            python_version: "39"
+            limited_api: "False"
+          - arch: x64
+            bazel_cpu: win64
+            python: "3.9"
+            python_version: "39"
+            limited_api: "False"
+          - arch: x86
+            bazel_cpu: win32
+            python: "3.10"
+            python_version: "310"
+            limited_api: "True"
+          - arch: x64
+            bazel_cpu: win64
+            python: "3.10"
+            python_version: "310"
+            limited_api: "True"
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+      - name: Install Bazelisk
+        run: choco install bazelisk -y
+      - name: Build wheel
+        run: >
+          bazel build //python/dist:binary_wheel
+          --cpu=${{ matrix.bazel_cpu }}
+          --//python:python_version=${{ matrix.python_version }}
+          --//python:limited_api=${{ matrix.limited_api }}
+      - name: Collect wheels
+        run: |
+          mkdir wheels
+          copy bazel-bin\python\dist\*.whl wheels\
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}-cp${{ matrix.python_version }}-wheel
+          path: wheels/
+
+  pure-python-wheel:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: MatteoH2O1999/setup-python@v6
+        with:
+          python-version: "3.8"
+      - name: Build pure python wheel
+        run: |
+          curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+            -o /usr/local/bin/bazel && chmod +x /usr/local/bin/bazel
+          pip install setuptools
+          bazel test //python/...
+          bazel build //python/dist:pure_python_wheel && bazel build //python/dist:source_wheel
+          mkdir -p wheels && cp bazel-bin/python/dist/*.whl wheels/ && cp bazel-bin/python/dist/*.tar.gz wheels/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pure-python-wheel
+          path: wheels/
+
+  collect-wheels:
+    runs-on: ubuntu-latest
+    needs:
+      - linux-x86_64-wheel
+      - linux-aarch64-wheel
+      # - macos-wheel
+      # - windows-wheels
+      - pure-python-wheel
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all-wheels
+          merge-multiple: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: all-wheels
+          path: all-wheels/
